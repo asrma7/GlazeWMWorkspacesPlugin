@@ -4,6 +4,9 @@ using System.Runtime.InteropServices;
 using Rainmeter;
 using WebSocketSharp;
 using System.Text.RegularExpressions;
+using System.Web.Script.Serialization;
+using System.Linq;
+using System.Collections;
 
 // Overview: This is a blank canvas on which to build your plugin.
 
@@ -17,49 +20,30 @@ namespace WebSocketClient
 {
     class Measure
     {
+        Dictionary<string, GlazeWorkspace> workspaces = new Dictionary<string, GlazeWorkspace>();
         WebSocket ws;
         IntPtr Skin;
         String cmdOnOpen;
-        String cmdOnMessage;
+        String cmdOnWorkspaceChanged;
         String cmdOnError;
         String cmdOnClose;
-
-        bool SendAsync; // Use async communication
-        bool KeepConnectionAlive; // Try to reconnect when connection is lost
-        bool PingServer; // Ping server to make sure connection is alive
-        int MaxReconnectAttempts; // If 0 try forever
-        bool TryToReconnect;
-        int CurrentAttempt;
-        DateTime LastConnectionAttempt;
-        DateTime LastPing;
-
-        struct Command
-        {
-            public String Tag;
-            public String cmdOnTag;
-        }
-        List<Command> Commands;
 
         static public implicit operator Measure(IntPtr data)
         {
             return (Measure)GCHandle.FromIntPtr(data).Target;
         }
 
+        public T DeserializeJson<T>(string Json)
+        {
+            JavaScriptSerializer javaScriptSerializer = new JavaScriptSerializer();
+            return javaScriptSerializer.Deserialize<T>(Json);
+        }
+
 
         public void Setup(Rainmeter.API api)
         {
-            // Init members
-            SendAsync = (api.ReadInt("SendAsync", 0) > 0);
-            TryToReconnect = false;
-            KeepConnectionAlive = (api.ReadInt("KeepAlive", 1) > 0);
-            PingServer = (api.ReadInt("PingServer", 0) > 0);
-            MaxReconnectAttempts = api.ReadInt("MaxReconnectAttempts", 0);
-            CurrentAttempt = 0;
-            LastConnectionAttempt = DateTime.Now;
-            LastPing = LastConnectionAttempt;
-
             // Setup WebSocket
-            String Address = api.ReadString("Address", "");
+            String Address = api.ReadString("Address", "ws://localhost:6123");
             if (!Address.IsNullOrEmpty())
             {
                 ws = new WebSocket(Address);
@@ -73,29 +57,9 @@ namespace WebSocketClient
             // Get Commands
             Skin = api.GetSkin();
             cmdOnOpen = api.ReadString("OnOpen", "");
-            cmdOnMessage = api.ReadString("OnMessage", "");
+            cmdOnWorkspaceChanged = api.ReadString("OnWorkspaceChanged", "");
             cmdOnError = api.ReadString("OnError", "");
             cmdOnClose = api.ReadString("OnClose", "");
-
-            // Get Parsable Commands
-
-            // Ex: ParseCommands="AA:|BB:|CMD:"
-            // OnAA:=[Some Bang]
-            // OnBB:=[Some Bang]
-            // OnCMD:=[Some Bang]
-
-            Commands = new List<Command>();
-            String cmds = api.ReadString("ParseCommands", "");
-            if (!cmds.IsNullOrEmpty())
-            {
-                var tags = cmds.Split('|');
-                foreach (var tag in tags)
-                {
-                    String c = api.ReadString("On" + tag, "");
-                    Commands.Add(new Command { Tag = tag, cmdOnTag = c });
-                }
-            }
-
         }
 
         public void Close()
@@ -108,39 +72,7 @@ namespace WebSocketClient
         {
             if (ws.ReadyState == WebSocketState.Open)
             {
-                if (SendAsync)
                     ws.SendAsync(s, null);
-                else
-                    ws.Send(s);
-                LastPing = DateTime.Now;
-            }
-        }
-
-        public void KeepAlive()
-        {
-            if (!KeepConnectionAlive)
-                return;
-
-            // Ping after some time to make sure connection is alive
-            if (PingServer && ws.ReadyState == WebSocketState.Open && DateTime.Now.Subtract(LastPing).Seconds > 3)
-            {
-                LastPing = DateTime.Now;
-                if (ws.Ping()) // For some reason Ping breaks the connection on my tests, something to do with mask bit
-                    return;
-            }
-
-            if (!TryToReconnect)
-                return;
-
-            if (MaxReconnectAttempts > 0 && CurrentAttempt > MaxReconnectAttempts)
-                return;
-
-            // Retry only if some time has passed
-            if (DateTime.Now.Subtract(LastConnectionAttempt).Seconds > 10)
-            {
-                ws.ConnectAsync();
-                CurrentAttempt++;
-                LastConnectionAttempt = DateTime.Now;
             }
         }
 
@@ -151,38 +83,33 @@ namespace WebSocketClient
 
         void OnOpen(object sender, EventArgs e)
         {
+            ws.Send("query workspaces");
+            ws.SendAsync("sub --events all", null);
             API.Execute(Skin, cmdOnOpen);
-            TryToReconnect = false;
-            LastPing = DateTime.Now;
         }
 
         void OnMessage(object sender, MessageEventArgs e)
         {
-            LastPing = DateTime.Now;
+            var jsonResponse = DeserializeJson<Dictionary<string, object>>(e.Data);
 
-            foreach (var Data in e.Data.Split(';'))
+            if (jsonResponse.ContainsKey("error") && jsonResponse["error"] != null)
             {
-                bool cmdParsed = false;
-
-                // Parse cmds
-                foreach (var C in Commands)
-                {
-                    if (Data.StartsWith(C.Tag))
-                    {
-                        string msg = Data.Substring(C.Tag.Length);
-                        string cmdmsg = Regex.Replace(C.cmdOnTag, "\\$message\\$", msg, RegexOptions.IgnoreCase);
-                        API.Execute(Skin, cmdmsg);
-                        cmdParsed = true;
-                        break;
-                    }
-                }
-
-                if (cmdParsed)
-                    continue;
-
-                //If no command is recognized
-                string cmd = Regex.Replace(cmdOnMessage, "\\$message\\$", Data, RegexOptions.IgnoreCase);
-                API.Execute(Skin, cmd);
+                API.Log(Skin, API.LogType.Error, jsonResponse["error"].ToString());
+            }
+            else if (jsonResponse["messageType"].ToString() == "client_response")
+            {
+                //API.Execute(Skin, "[!Log \"Client Response Recieved\"]");
+                HandleResponse(jsonResponse["clientMessage"].ToString(), jsonResponse["data"]);
+            }
+            else if (jsonResponse["messageType"].ToString() == "event_subscription")
+            {
+                var dataDict = jsonResponse["data"] as Dictionary<string, object>;
+                //API.Execute(Skin, "[!Log \"Client Event Recieved\"]");
+                HandleEvent(dataDict["eventType"].ToString(), jsonResponse["data"]);
+            }
+            else
+            {
+                API.Log(Skin, API.LogType.Debug, "MESSAGE: " + e.Data);
             }
         }
 
@@ -198,9 +125,132 @@ namespace WebSocketClient
             //Use regular experssion to replace $Message$ since str.replace can only be case sensitive
             string cmd = Regex.Replace(cmdOnClose, "\\$message\\$", e.Reason, RegexOptions.IgnoreCase);
             API.Execute(Skin, cmd);
+        }
 
-            TryToReconnect = !e.WasClean;
-            LastConnectionAttempt = DateTime.Now; // Wait a bit before reconnecting
+        private void HandleResponse(string request, object response)
+        {
+            var responseDict = response as Dictionary<string, object>;
+            switch (request)
+            {
+                case "query workspaces":
+                    {
+                        var workspacesList = responseDict["workspaces"] as ArrayList;
+
+                        if (workspacesList != null)
+                        {
+                            foreach (var workspaceToken in workspacesList)
+                            {
+                                var workspaceDict = workspaceToken as Dictionary<string, object>;
+
+                                if (workspaceDict != null)
+                                {
+                                    GlazeWorkspace workspace = new GlazeWorkspace
+                                    {
+                                        Id = workspaceDict["id"].ToString(),
+                                        Name = workspaceDict["name"].ToString(),
+                                        ParentId = workspaceDict["parentId"].ToString(),
+                                        HasFocus = (bool)workspaceDict["hasFocus"],
+                                        IsDisplayed = (bool)workspaceDict["isDisplayed"],
+                                        TilingDirection = workspaceDict["tilingDirection"].ToString()
+                                    };
+
+                                    if (!string.IsNullOrEmpty(workspace.Id))
+                                    {
+                                        workspaces[workspace.Id] = workspace;
+                                    }
+                                }
+                            }
+                            string cmd = Regex.Replace(cmdOnWorkspaceChanged, "\\$currentWorkspace\\$", GetDisplayedWorkspaceName(), RegexOptions.IgnoreCase);
+                            cmd = Regex.Replace(cmd, "\\$totalWorkspaces\\$", GetWorkspaceNameWithHighestValue(), RegexOptions.IgnoreCase);
+                            API.Execute(Skin, cmd);
+                        }
+                    }
+                    break;
+                default:
+                    //Console.WriteLine("Response: " + response);
+                    break;
+            }
+        }
+
+        private void HandleEvent(string eventType, object eventDataObj)
+        {
+            var eventData = eventDataObj as Dictionary<string, object>;
+            switch (eventType)
+            {
+                case "workspace_activated":
+                    {
+                        var workspaceDataDict = eventData["activatedWorkspace"] as Dictionary<string, object>;
+                        GlazeWorkspace workspaceData = new GlazeWorkspace
+                        {
+                            Id = workspaceDataDict["id"].ToString(),
+                            Name = workspaceDataDict["name"].ToString(),
+                            ParentId = workspaceDataDict["parentId"].ToString(),
+                            HasFocus = (bool)workspaceDataDict["hasFocus"],
+                            IsDisplayed = (bool)workspaceDataDict["isDisplayed"],
+                            TilingDirection = workspaceDataDict["tilingDirection"].ToString()
+                        };
+
+                        workspaces[workspaceData.Id] = workspaceData;
+                    }
+                    break;
+                case "workspace_deactivated":
+                    {
+                        string workspaceId = eventData["deactivatedId"].ToString();
+                        workspaces.Remove(workspaceId);
+                    }
+                    break;
+                case "focus_changed":
+                    {
+                        string workspaceId = null;
+                        var focusedContainer = eventData["focusedContainer"] as Dictionary<string, object>;
+
+                        if (focusedContainer["type"].ToString() == "window")
+                            workspaceId = focusedContainer["parentId"].ToString();
+                        else if (focusedContainer["type"].ToString() == "workspace")
+                            workspaceId = focusedContainer["id"].ToString();
+
+                        if (workspaceId != null)
+                        {
+                            string activeWorkspace = GetDisplayedWorkspaceId();
+                            if (activeWorkspace != null)
+                                workspaces[activeWorkspace].IsDisplayed = false;
+
+                            workspaces[workspaceId].IsDisplayed = true;
+                        }
+                        string cmd = Regex.Replace(cmdOnWorkspaceChanged, "\\$currentWorkspace\\$", GetDisplayedWorkspaceName(), RegexOptions.IgnoreCase);
+                        cmd = Regex.Replace(cmd, "\\$totalWorkspaces\\$", GetWorkspaceNameWithHighestValue(), RegexOptions.IgnoreCase);
+                        API.Execute(Skin, cmd);
+                    }
+                    break;
+                default:
+                    //Console.WriteLine("EventType: " + eventType);
+                    //Console.WriteLine("EventData: " + eventData);
+                    break;
+            }
+        }
+
+        private string GetDisplayedWorkspaceId()
+        {
+            return workspaces.Values
+                     .FirstOrDefault(workspace => workspace.IsDisplayed)
+                     ?.Id;
+        }
+
+        private string GetDisplayedWorkspaceName()
+        {
+            return workspaces.Values
+                     .FirstOrDefault(workspace => workspace.IsDisplayed)
+                     ?.Name;
+        }
+
+        public string GetWorkspaceNameWithHighestValue()
+        {
+            var highestValueWorkspace = workspaces.Values
+                .Where(workspace => int.TryParse(workspace.Name, out _))
+                .OrderByDescending(workspace => int.Parse(workspace.Name))
+                .FirstOrDefault();
+
+            return highestValueWorkspace?.Name;
         }
 
     }
@@ -235,7 +285,6 @@ namespace WebSocketClient
         public static double Update(IntPtr data)
         {
             Measure measure = (Measure)data;
-            measure.KeepAlive();
             double state = (double)measure.GetState();
             return state;
         }
@@ -263,5 +312,16 @@ namespace WebSocketClient
         //
         //    return Marshal.StringToHGlobalUni(""); //returning IntPtr.Zero will result in it not being used
         //}
+    }
+
+    public class GlazeWorkspace
+    {
+        public string Id { get; set; }
+        public string Name { get; set; }
+        public string DisplayName { get; set; }
+        public string ParentId { get; set; }
+        public bool HasFocus { get; set; }
+        public bool IsDisplayed { get; set; }
+        public string TilingDirection { get; set; }
     }
 }

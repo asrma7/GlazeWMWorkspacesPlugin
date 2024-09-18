@@ -66,6 +66,9 @@
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="System" />
+    <Reference Include="System.Runtime.Serialization" />
+    <Reference Include="System.Web.Extensions" />
+    <Reference Include="System.Xml" />
     <Reference Include="websocket-sharp, Version=0.0.1.0, Culture=neutral, processorArchitecture=MSIL">
       <HintPath>..\packages\SIPSorcery.WebSocketSharp.0.0.1\lib\net452\websocket-sharp.dll</HintPath>
     </Reference>
@@ -76,6 +79,7 @@
     <Compile Include="RainmeterAPI.cs" />
   </ItemGroup>
   <ItemGroup>
+    <None Include="app.config" />
     <None Include="ILMerge.props" />
     <None Include="packages.config" />
   </ItemGroup>
